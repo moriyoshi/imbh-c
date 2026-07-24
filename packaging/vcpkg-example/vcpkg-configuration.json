@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg-configuration.schema.json",
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "REPLACE_WITH_A_VCPKG_COMMIT_SHA"
+  },
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/moriyoshi/imbh-c",
+      "baseline": "REPLACE_WITH_IMBH_C_COMMIT_SHA",
+      "packages": ["imbh-c"]
+    }
+  ]
+}

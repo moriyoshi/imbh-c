@@ -1,0 +1,207 @@
+name: Release
+
+# Builds the static (.a/.lib) and dynamic-link (.so/.dylib/.dll) libraries for every supported
+# architecture/OS, packages each with the committed headers and pkg-config template, and:
+#   - uploads them as workflow artifacts on every push/PR (continuous build coverage), and
+#   - attaches them to a GitHub Release on version tags (`v*`).
+#
+# The IMBH deps (`imbh`, `imbh-lgtm`, `imbh-core`) are declared in Cargo.toml with a local
+# `path = "../imbh/crates/..."` override for local dev. That sibling checkout does not exist in CI, so
+# the `Strip ../imbh path override` step below removes the path attributes and lets Cargo resolve the
+# published `0.1` crates from crates.io. This mutates the working tree in CI only; the committed
+# Cargo.toml keeps the path override for local development.
+#
+# The build is hermetic: protobuf is pure-Rust (protox, no system protoc), cbindgen is pure-Rust, and the
+# only native C compiled is vendored zstd/lz4 via `cc`. cargo-zigbuild supplies the cross C toolchain for
+# the four Linux gnu+musl targets from a single runner; Apple clang cross-compiles the x86_64 darwin
+# target on the Apple-Silicon runner.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify gate (fmt / build / header / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Strip ../imbh path override (resolve imbh from crates.io)
+        shell: bash
+        run: |
+          sed -i.bak -E 's#, *path *= *"\.\./imbh/crates/[^"]*"##g' Cargo.toml && rm -f Cargo.toml.bak
+          if grep -q '\.\./imbh' Cargo.toml; then echo "::error::path override not stripped"; exit 1; fi
+          cargo generate-lockfile
+      - name: Format check
+        run: cargo fmt --check
+      - name: Build (release)
+        run: cargo build --release
+      - name: Header freshness (include/imbh.h must match cbindgen output)
+        # build.rs regenerates the committed header on every build but swallows cbindgen errors as
+        # warnings, so this explicit diff is the real gate. Only the header path is checked — the
+        # strip-path step above intentionally modified Cargo.toml.
+        run: git diff --exit-code include/imbh.h
+      - name: Clippy (all targets, release)
+        run: cargo clippy --all-targets --release -- -D warnings
+      - name: Test (release — drives the extern "C" surface via tests/roundtrip.rs)
+        run: cargo test --release
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            zig: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: x86_64-apple-darwin
+            os: macos-14
+            zig: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            zig: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            zig: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+      - name: Set up Zig (cross C toolchain for zigbuild)
+        if: matrix.zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
+        with:
+          tool: cargo-zigbuild
+      - name: Strip ../imbh path override (resolve imbh from crates.io)
+        shell: bash
+        run: |
+          sed -i.bak -E 's#, *path *= *"\.\./imbh/crates/[^"]*"##g' Cargo.toml && rm -f Cargo.toml.bak
+          if grep -q '\.\./imbh' Cargo.toml; then echo "::error::path override not stripped"; exit 1; fi
+          cargo generate-lockfile
+      - name: Build (zigbuild)
+        if: matrix.zig
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Build (native)
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Version: tag name minus leading "v" on tag refs, else 0.0.0-<short-sha>.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="0.0.0-${GITHUB_SHA::7}"
+          fi
+          TARGET="${{ matrix.target }}"
+          NAME="imbh-c-${VER}-${TARGET}"
+          OUT="target/${TARGET}/release"
+          stage="staging/${NAME}"
+          mkdir -p "${stage}/include/arrow/c" "${stage}/lib"
+
+          # Headers (committed, source of truth).
+          cp include/imbh.h include/imbh.hpp "${stage}/include/"
+          cp include/arrow/c/abi.h "${stage}/include/arrow/c/"
+
+          # pkg-config template rendered with a conventional prefix.
+          sed 's#@PREFIX@#/usr/local#' imbh.pc.in > "${stage}/imbh.pc"
+          cp README.md "${stage}/"
+          [[ -f LICENSE ]] && cp LICENSE "${stage}/" || true
+
+          # Libraries: collect the dynamic + static artifacts that exist for this target.
+          copied=0
+          for f in libimbh_c.so libimbh_c.dylib libimbh_c.a \
+                   imbh_c.dll imbh_c.dll.lib imbh_c.lib; do
+            if [[ -f "${OUT}/${f}" ]]; then
+              cp "${OUT}/${f}" "${stage}/lib/"
+              copied=$((copied + 1))
+            fi
+          done
+          if [[ "${copied}" -eq 0 ]]; then
+            echo "::error::no library artifacts found in ${OUT}"
+            ls -la "${OUT}" || true
+            exit 1
+          fi
+          ls -la "${stage}/lib"
+
+          # Archive: .zip on Windows, .tar.gz elsewhere.
+          mkdir -p dist
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            ARCHIVE="dist/${NAME}.zip"
+            (cd staging && 7z a -tzip "../${ARCHIVE}" "${NAME}" >/dev/null)
+          else
+            ARCHIVE="dist/${NAME}.tar.gz"
+            tar -czf "${ARCHIVE}" -C staging "${NAME}"
+          fi
+          echo "archive=${ARCHIVE}" >> "${GITHUB_OUTPUT}"
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: imbh-c-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum imbh-c-*.tar.gz imbh-c-*.zip > SHA256SUMS 2>/dev/null || \
+            sha256sum imbh-c-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: |
+            dist/imbh-c-*.tar.gz
+            dist/imbh-c-*.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true

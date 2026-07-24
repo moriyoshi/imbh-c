@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "imbh-c",
+  "version": "0.0.0",
+  "description": "C/C++ bindings for IMBH, the embeddable observability database: open a Db, ingest OTLP, run SQL/PromQL/LogQL/TraceQL, and receive results zero-copy as an Arrow C Data Interface stream.",
+  "homepage": "https://github.com/moriyoshi/imbh-c",
+  "documentation": "https://github.com/moriyoshi/imbh-c/blob/main/README.md",
+  "license": "Apache-2.0",
+  "supports": "(x64 & (linux | osx | windows)) | (arm64 & (linux | osx))"
+}

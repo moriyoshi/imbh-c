@@ -1,0 +1,13 @@
+imbh-c provides CMake targets:
+
+    find_package(imbh-c CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE imbh-c::imbh-c)
+
+Then include the C or C++ API:
+
+    #include <imbh.h>     // C ABI
+    #include <imbh.hpp>   // header-only C++ RAII wrapper
+
+Query results cross the boundary zero-copy as an Arrow C Data Interface
+`struct ArrowArrayStream` (imbh.h pulls in <arrow/c/abi.h>; a vendored copy ships
+with this package, and a consumer that also installs `arrow` picks up theirs).

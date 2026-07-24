@@ -1,0 +1,58 @@
+[package]
+name = "imbh-c"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+publish = false
+description = "C/C++ FFI bindings for IMBH: open a Db, ingest OTLP, run SQL, get results as Arrow (C Data Interface)."
+
+[lib]
+# `cdylib` for dynamic linking (libimbh_c.so / .dylib / imbh_c.dll), `staticlib` for a self-contained
+# archive (libimbh_c.a) a C/C++ host links directly. `rlib` so the crate's own Rust integration tests
+# can call the `extern "C"` surface in-process.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# The IMBH facade, now published to crates.io at v0.1.0. We carry a `version` alongside `path` (the
+# same pattern IMBH uses for its own internal deps): local builds resolve against the sibling checkout,
+# while the version requirement pins the published API this binding was written against. `search` keeps
+# full-text `matches` index-accelerated; `cdata` re-exports the Arrow C Data Interface structs off the
+# SAME arrow instance the query engine allocates batches with; `proto` adds the protobuf query-input
+# types (`imbh::proto::*`), their `TryFrom` mappings onto the typed builders, and the `*_batches` Arrow
+# query entry points (ARCHITECTURE.md §10.17). We deliberately do NOT depend on `arrow` directly —
+# every Arrow type is named through `imbh::arrow` / `imbh::FFI_*` so exactly one arrow crate is linked
+# and the FFI structs stay ABI-compatible across the boundary (ARCHITECTURE.md §9.1, single-arrow rule).
+imbh = { version = "0.1", path = "../imbh/crates/imbh", features = ["search", "cdata", "proto"] }
+# The LGTM-stack query-language layer (PromQL / LogQL / TraceQL), published alongside the facade.
+# `source` pulls the native execution traits (`*SemanticsExt`) that evaluate a translated query against
+# `imbh::Db` and return Arrow batches (`execute_{promql,logql,traceql}_batches`) — the same surfaces the
+# Go binding exposes. It depends on the SAME `imbh` (workspace/path), so the single-arrow rule holds and
+# no second arrow crate is linked. Version + path mirror the `imbh` dep above.
+imbh-lgtm = { version = "0.1", path = "../imbh/crates/imbh-lgtm", features = ["source"] }
+# The foundation crate, for `canonical_json_object` — the byte-stable label-set JSON encoder imbh's own
+# metric series / volume buckets are keyed by. Used to render the `labels` column of the discovery
+# surfaces (metric series, instant, log volume) in exactly the form imbh parsed them from, so a caller
+# joins them against other results. Same version + path as `imbh`; it links the one `imbh-core` already
+# in the graph, no new crate.
+imbh-core = { version = "0.1", path = "../imbh/crates/imbh-core" }
+# One owned current-thread runtime to drive the async `Db` API from synchronous C (mirrors what
+# `imbh::Db::blocking()` does internally); `rt` only, no timers/IO drivers needed for this surface.
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+[build-dependencies]
+# Generates `include/imbh.h` from the `extern "C"` surface at build time.
+cbindgen = "0.29"
+
+[dev-dependencies]
+# Build tiny OTLP ExportRequest payloads in the Rust round-trip tests. Pinned to the versions IMBH
+# uses so the protobuf types match its decoder.
+opentelemetry-proto = { version = "0.32", default-features = false, features = [
+    "gen-tonic-messages",
+    "logs",
+    "trace",
+    "metrics",
+] }
+prost = "0.14"
+# Scratch directories for the on-disk lifecycle tests (open/flush/export/snapshot/segments/read-only).
+tempfile = "3"

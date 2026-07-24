@@ -1,0 +1,12 @@
+# pkg-config template for imbh-c. Configure the paths for your install layout, drop the result on
+# PKG_CONFIG_PATH, then build consumers with `pkg-config --cflags --libs imbh`.
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: imbh
+Description: C/C++ API for the IMBH embeddable observability database
+Version: 0.0.0
+Libs: -L${libdir} -limbh_c
+Cflags: -I${includedir}
